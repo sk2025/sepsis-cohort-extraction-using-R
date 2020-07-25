@@ -1,0 +1,368 @@
+
+# Homework 1: Cohort Building [80 points]
+
+### HIDS 501, Fall 2019 
+
+### Due: Thursday, October 18, 2019
+
+In this assignment you will gain experience extracting and transforming clinical data into datasets for downstream statistical analysis. You will practice using common time-saving tools in the R programming language that are ideally suited to these tasks.
+
+You will use the [MIMIC III database](https://mimic.physionet.org/mimictables/patients/) as a sandbox to create a dataset describing a cohort of patients admitted to the Intensive Care Unit of the Beth Israel Deaconess Medical Center in Boston, Massachusetts. You will analyze this cohort to identify patients that undergo septic shock during their admission. We will be following along with the cohort building process presented in ["A targeted real-time early warning score (TREWScore) for septic shock" by Henry et al.](http://stm.sciencemag.org/content/7/299/299ra122.full) published in Science Translational Medicine in 2015. We will also be referring to [a cited paper by Angus et al](https://github.com/MIT-LCP/mimic-code/blob/master/concepts/sepsis/angus2001.pdf). All of the data you need for this assignment is available on Box
+
+Please edit this document directly using Jupyter or Rmarkdown and answer each of the questions in-line. Jupyter is a useful tool for reproducible research and it is worth taking the short amount of time necessary to learn it. Turn in a single .pdf document (alongwith the completed Rmarkdown or Jupyter notebook) showing all of your code and output for the entire assignment, with each question clearly demarcated. Submit your completed assignment through Canvas.
+
+## 0. Getting Ready
+The first thing we need to do is load all of the packages we will use for this assignment. Please load the packages `tidyverse`, `data.table`, and `lubridate`. Also, please run the command `Sys.setenv(TZ='UTC')`. Without it, your date-time data will misbehave.
+```{r library}
+library(tidyverse)
+library(data.table)
+library(lubridate)
+Sys.setenv(TZ = 'UTC')
+
+#dir()
+#getwd()
+```
+
+## 1. Building a Cohort Based on Inclusion Criteria and Defining Endpoints
+### Loading Data
+
+#### 1.1 (5 pts)
+
+The first part of any patient-level study is to identify a cohort of patients who are relevant to the study, and at what point during their records they became eligible. Typically, this is done with a set of "inclusion critera", which, if met, qualify the patient for inclusion in the cohort. 
+
+In our study, we will consider the inclusion criteria used in the TREWScore paper.
+
+Read the first paragraph of the *Materials and Methods - Study Design* in the TREWScore paper. What criteria did the authors use to determine which patients should enter the study?
+
+*Answer:* Patient age 15 years or greater at ICU admission with at least one assessment each of GCS, BUN, hematocrit, and heart rate recorded in the EHR. (Author identified 16,234 distinct patients)
+
+#### 1.2 (5 pts)
+
+Once you have found the inclusion criteria, take a look at the [MIMIC documentation](https://mimic.physionet.org/about/mimic/) and report which table(s) in MIMIC you would query in order to identify patients that meet the inclusion criteria. If you're stuck, try looking through the [mimic-code repository](https://github.com/MIT-LCP/mimic-code) provided by the MIMIC maintainers to get some ideas as to how to query the database.
+
+*Answer:* We need PATIENT dataset to get the age of patients. 
+To get at least one assessment informaton of GCS and Heart Rate: In D_ITEMS dataset which have "Heart Rate" and "GCS Total" in LABEL column with curresponding ITEMID (211 and 198) field. We have to merge this dataset with CHARTEVENTS dataset by matching ITEMID to get the VALUE. 
+To get the value for BUN and hematocrit: In D_LABITEMS dataset which have "Hematocrit, CSF" and "Urea Nitrogen" in LABEL column with curresponding ITEMID (51348 and 51006) field. We have to merge this dataset with LABEVENTS dataset by matching ITEMID to get the VALUE. 
+By merging all the datasets and find subjects having atleast one assessment in each to include this cohort
+
+#### 1.3 (5 pts) 
+
+It can be tricky to develop the SQL queries necessary to extract the cohort of interest. Fortunately, the course staff ran the necessary query on the MIMIC III database to extract the identifiers of patients that meet the inclusion criteria discussed above. 
+
+Read the vitals and labs data for our cohort stored in *vitals_cohort_sirs.csv* and *labs_cohort* into R dataframes. 
+Since these CSV files are moderately sized, we suggest using a function from the [readr](https://cran.r-project.org/web/packages/readr/readr.pdf) or [data.table](https://cran.r-project.org/web/packages/data.table/data.table.pdf) packages to load the data.
+
+```{r Importing labs and vitals dataset}
+read_csv("./vitals_cohort_sirs.csv", n_max = 100000) -> vitals_cohort_sirs
+read_csv("./labs_cohort.csv", n_max = 100000) -> labs_cohort
+```
+
+Once you have loaded the files into R dataframes, call `head` and `str` on each dataframe to get a feel for what is contained in each column.
+
+```{r }
+#For Labs_cohort
+head(labs_cohort)
+str(labs_cohort)
+
+#For vitals_cohort_sirs
+head(vitals_cohort_sirs)
+str(vitals_cohort_sirs)
+
+#Loading library to clean the dataset
+library(janitor)
+
+#Creating function column_clean_up
+column_clean_up <- function(col){
+  col %>%
+    tolower() %>%
+    str_trim() %>%
+    str_squish() # removes repeated white spaces
+}
+
+#Cleaning labs_cohort
+labs_cohort %>%
+  clean_names() %>%
+  mutate_if(is_character, column_clean_up) -> labs_cohort
+
+#cleaning vitals_cohort_sirs
+vitals_cohort_sirs %>%
+  clean_names() %>%
+  mutate_if(is_character, column_clean_up) -> vitals_cohort_sirs
+```
+
+#### 1.4 (10 pts) 
+
+The Systemic Inflammatory Response Syndrome (SIRS) criteria has been an integral tool for the clinical definition of sepsis for the past several decades. In the TREWScore paper, the authors considered a patient to have sepsis if at least two of the four SIRS criteria were simultaneously met during an admission where a suspicion of infection was also present.
+
+The four SIRS criteria are as follows:
+1. Temperature > 38&deg;C or < 36&deg;C
+2. Heart Rate > 90
+3. Respiratory Rate > 20 or PaCO$_{2}$< 32mmHg
+4. WBC > 12,000/$mm^{3}$, < 4000/$mm^{3}$, or > 10% bands
+
+You may read more about SIRS (and some recent associated controversies surrounding its use) at https://www.ncbi.nlm.nih.gov/pubmed/1303622 and http://www.nejm.org/doi/full/10.1056/NEJMoa1415236#t=article.
+
+The next step in our process will be to assess whether patients satisfy each of the SIRS criteria at each time step that vitals or lab data is available. To this end, we would like to have a dataframe where each row corresponds to a unique combination of *subject_id*, *hadm_id*, *icustay_id*, and *charttime*, and with one column for each unique type of lab or vital that was measured at that time. This may seem complicated at first, so let's walk through it step-by-step to build some intuition.
+
+First, notice that some patients have multiple measurements of a given vital or lab that were taken at the same time. There may also have been multiple types of raw measurement that were mapped to the same measurement label.
+
+You can count the number of measurements of a given lab or vital taken at a given time for every patient using the `group_by` and `summarise` commands from `dplyr`:
+
+
+```R
+#labs_per_px_time <- labs_cohort %>%
+#    group_by(subject_id, hadm_id, icustay_id, charttime, lab_id) %>%
+#    summarise(n = n())
+
+#labs_per_px_time %>% 
+#  filter(n > 1) %>% view()
+```
+
+There are a few ways to summarize the data for a patient at a given time point into a single value. One way is to pick a random measurement from the set taken at a given time, another is to summarize the measurements by some operation e.g. taking the mean.
+
+Implement a solution to summarize the values by calculating the mean value for each patient at a given time point. One approach could use the `group_by`, `summarise` and `ungroup` commands from `dplyr`.
+```{r Finding mean value - for labs}
+labs_cohort %>% 
+  group_by(subject_id, hadm_id, icustay_id, charttime, lab_id) %>% 
+  summarise(value = mean(valuenum)) %>%
+  ungroup() -> labs_cohort
+```
+```{r Finding mean value - for vitals}
+vitals_cohort_sirs %>% 
+  group_by(subject_id, hadm_id, icustay_id, charttime, vital_id) %>% 
+  summarise(value = mean(valuenum)) %>%
+  ungroup() -> vitals_cohort_sirs
+
+
+```
+
+After you have done this, pivot on *lab_id* and *vital_id* again and  use `str` to inspect the resulting dataframes. In other words, create a new column for each unique measurement type in your labs and vitals data frames where the rows are given by unique combinations of *subject_id*, *hadm_id*, *icustay_id*, *charttime*, *vital_id*. If a complete set of measurements is not available in a particular row of the resulting dataframe, fill in the value with an `NA`. A solution could use `spread` from `dplyr` or `dcast` from `data.table`.
+```{r spread lb}
+labs_cohort %>% 
+  spread(lab_id, value) -> lb1
+```
+```{r spread vs}
+vitals_cohort_sirs %>% 
+  spread(vital_id, value) -> vs1
+```
+
+#### 1.5 (5 pts)
+
+Since the measurement times for the vital signs may be different from those of the labs, the next step is to merge the vitals and labs dataframes together to get the full timeline for each patient. 
+
+Using a command such as `full_join` or `merge`, merge the pivoted labs and vitals dataframes you generated previously, using the common columns in the two dataframes. There should be one row for each unique combination of *subject_id*, *hadm_id*, *icustay_id*, *charttime*, *vital_id* observed in either dataframe.
+```{r}
+lb1 %>% 
+  full_join(vs1, by = c("subject_id", "hadm_id", "icustay_id", "charttime")) -> lb2
+```
+#### 1.6 (5 pts)
+
+You will notice that the resulting dataframe contains a lot of "missing" values recorded as `NA`. There are many potential approaches for handling missing values that we could take to address this issue. In this case, we are going to use a last-value-carried-forward approach within an ICU stay to fill in missing values.
+
+In a sentence or two, discuss any potential benefits and drawbacks of this approach. After that, implement this strategy using commands of your choice.
+
+*Answer:* benefit for LOCF method: Subject may be withdrawn from study before study completion. LOCF will impute the last observation of the subject for missing value, which minimize the number of subject who are eliminated from analysis (to maintain the sample size). 
+drawbacks: Imputing may lead to bias in the study. We cannot analyse the trend/ the affect of drug over time by imputing the last observation (It assume the response is constant over time). 
+        
+```{r}
+library(zoo)
+
+#lb2 %>% 
+#  group_by(subject_id) %>%
+#   fill(ALBUMIN) -> lb4 
+#  na.locf(na.rm = FALSE) -> lb3
+#  na.locf(na.rm = TRUE) -> lb3
+
+
+#lb2 %>% 
+#  arrange(icustay_id) %>% pull(icustay_id) %>% unique() -> icustay
+
+#lb2 %>% 
+#  arrange(subject_id) -> temp5
+#  group_by(icustay_id) %>% 
+#  split(temp5,f = lb2$subject_id) -> temp3
+  
+#  split(temp3,)
+  
+lb2 %>% 
+  arrange(subject_id,icustay_id, charttime) %>% 
+  group_by(icustay_id) %>% 
+  fill(4:28) -> lb3
+```
+
+#### 1.7 (10 pts)
+Now we have a record of the most recent value for each lab or vital within an ICU stay for each patient in our development set. From this data, create a new dataframe called *SIRS* that has a record for each row in your timeline dataframe developed previously and a column indicating whether each of the SIRS criteria were satisfied at each chart time, and a final column indicating whether at least 2 of the SIRS criteria were satisfied. Assume that if a value is unknown that the patient does not meet that SIRS criterion.
+
+```{r}
+#SIRS Criteria
+#1.Temperature > 38&deg;C or < 36&deg;C
+#2. Heart Rate > 90
+#3. Respiratory Rate > 20 or PaCO$_{2}$< 32mmHg
+#4. WBC > 12,000/$mm^{3}$, < 4000/$mm^{3}$, or > 10% bands
+
+
+#Keeping the required variable alone to have handy look for the dataset. We can remove this filter condition if any other variables are requred for further analysis.
+
+# In each sirs column, 1 represents the criteria is satisfied and 0 represent the criteria is not satisfied.
+#sirs_flag variable have value 1 for the observation which satisfied atleast 2 SIRS criteria
+
+lb3[c("subject_id", "hadm_id","icustay_id","charttime","tempc","heartrate","resprate","wbc","paco2")] %>% 
+  mutate(sir1 = ifelse(tempc > 38 | tempc < 36,1, 0)) %>% 
+  mutate(sir2 = ifelse(heartrate > 90,1, 0)) %>% 
+  mutate(sir3 = ifelse(resprate > 20 | paco2 < 32 ,1, 0)) %>% 
+  mutate(sir4 = ifelse(wbc > 12 | wbc < 4 ,1, 0))  %>% 
+  mutate(sirs_flag = ifelse(ifelse(is.na(sir1),0,sir1) + ifelse(is.na(sir2),0,sir2) + ifelse(is.na(sir3),0,sir3) + ifelse(is.na(sir4),0,sir4) >= 2,1,0)) -> SIRS
+
+#table(SIRS$sirs_flag)
+#head(SIRS)
+
+```
+
+#### 1.8 (10 pts)
+
+At this point, we have computed the SIRS criteria for every patient in our cohort. Now it's time to determine which patients had suspicion of infection. In the TREWScore paper, the authors use a set of ICD9 codes to identify infection-related diagnoses.
+
+The course staff has extracted the entirety of the relevant table where ICD9 codes are stored in MIMIC and provided it for you in *diagnoses.csv*.
+
+Additionally, for your convenience, we include the set of reference information from the paper that will be useful in determining which admissions indicate infection. Using this reference information, filter the provided table such that it includes only admissions from the cohort that have at least one string that *starts with* one of the provided ICD9 codes that indicate infection.
+
+We suggest using functions from the `stringr` package.
+
+```{r} 
+# Provided
+infection3digit <- c('001','002','003','004','005','008',
+                     '009','010','011','012','013','014','015','016','017','018',
+                     '020','021','022','023','024','025','026','027','030','031',
+                     '032','033','034','035','036','037','038','039','040','041',
+                     '090','091','092','093','094','095','096','097','098','100',
+                     '101','102','103','104','110','111','112','114','115','116',
+                     '117','118','320','322','324','325','420','421','451','461',
+                     '462','463','464','465','481','482','485','486','494','510',
+                     '513','540','541','542','566','567','590','597','601','614',
+                     '615','616','681','682','683','686','730'
+                    )
+infection4digit <- c('5695','5720','5721','5750','5990','7110',
+                     '7907','9966','9985','9993'
+                    )
+infection5digit <- c('49121','56201','56203','56211','56213', '56983')
+infection_codes <- c(infection3digit, infection4digit, infection5digit)
+```
+```{r}
+#Import the diagnoses.csv dataset
+read_csv("./diagnoses.csv", n_max = 100000) -> diagnoses
+
+library(stringr)
+
+#Concatenating regular expression "^" to check the start with condition in infection_codes string 
+infection_codes1 <- str_c("^", infection_codes)
+
+diagnoses %>% 
+  filter(str_detect(diagnoses$icd9_code, paste(infection_codes1,collapse = '|'))) -> diag1
+
+#head(diag1)
+```
+
+#### 1.9 (5 pts)
+In the paper, the authors also consider a patient to have infection during an admission if there is at least one mention of 'sepsis' or 'septic' in a clinical note for the admission. The course staff has done the work of extracting the clinical notes for the cohort.
+
+Load the notes data from *notes.csv* into a dataframe. Once you have done so, apply the string matching techniques you developed above to identify admissions that mention the terms 'sepsis' or 'septic'. 
+
+```{r}
+read_csv("./notes.csv", n_max = 100000) -> notes
+
+sepsis_notes <- c('SEPSIS', 'SEPTIC')
+
+notes %>% 
+  filter(str_detect(toupper(notes$text), paste(sepsis_notes,collapse = '|'))) -> notes1
+
+```
+
+
+#### 1.10 (5 pts)
+At this stage, we now have all the information we need to determine the times that patients meet the criteria for sepsis. Join the results from the search for patients with infection codes and sepsis notes with your SIRS data frame and label the chart times that meet the TREWScore paper's definition of sepsis.
+
+
+```{r}
+SIRS %>%
+  inner_join(diag1[c("subject_id", "hadm_id", "icd9_code")], by = c("subject_id", "hadm_id")) -> SIRS1a
+
+SIRS %>% 
+  inner_join(notes1[c("subject_id", "hadm_id", "charttime", "text")], by = c("subject_id", "hadm_id", "charttime")) -> SIRS1b 
+
+
+#Creating dataset containing subject who met SIRS criteria for Sepsis
+SIRS1a %>%
+  full_join(SIRS1b[c("subject_id", "hadm_id", "charttime", "text")], by = c("subject_id", "hadm_id", "charttime")) %>% 
+  mutate(sepsis = ifelse(sirs_flag == 1 & (is.na(icd9_code) == FALSE | is.na(text)),TRUE,FALSE)) -> sepsis
+```
+
+#### 1.11 (10 pts)
+
+In the TREWScore paper, the authors also identify patients with **severe sepsis** and **septic shock**. Severe sepsis is defined as sepsis with **organ dysfunction**. Septic shock is defined as **severe sepsis**, **hypotension**, and **adequate fluid resuscitation** occurring at the same time.  In order to determine which patients met the criteria for *severe sepsis* and *septic shock* according to the TREWScore paper, we will first need to define the concepts of **organ dysfunction**, **adequate fluid resuscitation**, and **hypotension**.
+
+Unfortunately, the criteria the authors use to define organ dysfunction is rather cumbersome. Instead of implementing that criteria explicitly, we adopt a simpler approach. In the Angus 2001 paper (linked at the top of the assignment), the authors did just that by defining a set of ICD9 codes as a proxy for sepsis-related organ dysfunction. As before, we provide the list of relevant parent ICD9 codes. Using those codes *prefixes*, identify the admissions  where an ICD9 codes that starts with one of those prefixes was assigned to determine those admissions that meet the crtieria for organ dysfunction.
+
+Once you have identified the admissions where patients suffered from organ failure, derive labels for **severe sepsis** for the set of chart times that you have previously labeled for sepsis.
+
+
+```{r}
+code_prefixes <- c('458','293','570','584', '7855','3483','3481', '2874','2875','2869','2866','5734')
+
+code_prefixes1 <- str_c("^", code_prefixes)
+
+
+diagnoses %>% 
+  filter(str_detect(icd9_code, paste(code_prefixes1,collapse = '|'))) -> org_disf
+
+sepsis %>%
+  left_join(org_disf[c("subject_id", "hadm_id", "icd9_code")], 
+            by = c("subject_id", "hadm_id")) %>% 
+  mutate(severe_sepsis = ifelse(sepsis == TRUE & 
+                                  is.na(icd9_code.y) == FALSE, TRUE,FALSE))  -> severe_sepsis
+
+```
+
+#### 1.12 Tying it all together (5 pts) 
+
+The course staff have created a dataset with a variable indicating whether a patient had adequate fluid resuscitation or was hypotensive at each timepoint in their record. 
+These data are stored in **fluids_all.csv**, **hypotension_labels.csv**. Use this data in combination with your dataframe that indicates whether a patient has severe sepsis at a given time to determine whether a patient has adequate fluid resuscitation and is hypotensive at each timepoint in their record. You may handle "missing" data in any way you deem reasonable.
+
+```{r}
+
+"./fluids_all.csv" %>% 
+  read_csv(n_max = 100000) %>% 
+  filter(adequate_fluid == TRUE) -> fluids_all
+
+severe_sepsis %>% 
+  left_join(fluids_all[c("subject_id", "hadm_id", "charttime", "adequate_fluid")], 
+            by = c("subject_id", "hadm_id", "charttime" )) -> SHOCK1
+
+"./hypotension_labels.csv" %>% 
+  read_csv(n_max = 100000) %>% 
+  filter(hypotension == TRUE) -> hypotension_labels
+
+SHOCK1 %>% 
+  left_join(hypotension_labels[c("subject_id", "hadm_id", "charttime","icustay_id", "hypotension")], 
+            by = c("subject_id", "hadm_id","icustay_id", "charttime" )) %>% 
+  mutate(septic_shock = ifelse(severe_sepsis == TRUE & 
+                                  is.na(adequate_fluid) == FALSE & is.na(hypotension) == FALSE, TRUE,FALSE)) -> SHOCK2
+
+
+#Final output
+SHOCK2[c("subject_id", "hadm_id","icustay_id", "charttime", "sepsis", "severe_sepsis", "septic_shock")] %>% 
+  distinct() -> HW1
+
+#SHOCK2[c("subject_id", "hadm_id","icustay_id", "charttime", "sepsis", "severe_sepsis", "septic_shock")] %>% 
+#  distinct() %>% 
+#  group_by(subject_id, hadm_id, icustay_id, charttime) %>% 
+#  summarise(count = n()) %>% 
+#  filter(count > 1) %>% view()
+
+```
+
+Use this data in combination with your dataframe that indicates whether a patient has severe sepsis at a given time to determine whether a patient is in septic shock at each timepoint in their record. Create a timeline that merges the labels you derived for each sepsis grade such that for each unique observation time for each patient, you have a binary label for each of *sepsis*, *severe sepsis*, and *septic shock*. 
+
+In the next assignment, we will use this cohort to derive labels as targets of a predictive model.
+
+`
+Congratulations! You've extracted a patient cohort from MIMIC and derived multiple sepsis-related endpoints. You're done!
